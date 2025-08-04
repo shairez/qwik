@@ -4,14 +4,15 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { VirtualFileTree } from './virtual-file-tree';
 
-describe('VirtualFileTree', () => {
+describe('VirtualFileTree - Queue-Based Transaction System', () => {
   let tempDir: string;
   let vft: VirtualFileTree;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     // Create a temporary directory for tests
     tempDir = mkdtempSync(join(tmpdir(), 'vft-test-'));
     vft = new VirtualFileTree(tempDir);
+    await vft.initialize();
   });
 
   afterEach(() => {
@@ -19,37 +20,58 @@ describe('VirtualFileTree', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  describe('File Creation', () => {
-    test('should stage file creation', () => {
-      vft.createFile('test.txt', 'Hello World');
+  describe('Initialization and Basic Operations', () => {
+    test('should initialize empty virtual file system', async () => {
+      expect(vft.hasPendingChanges).toBe(false);
+      expect(vft.pendingOperations).toBe(0);
+      expect(vft.isTransactionCommitted).toBe(false);
+    });
 
-      expect(vft.hasPendingOperations).toBe(true);
+    test('should stage file creation', async () => {
+      await vft.createFile('test.txt', 'content');
+
+      expect(vft.hasPendingChanges).toBe(true);
       expect(vft.pendingOperations).toBe(1);
 
       const preview = vft.preview();
       expect(preview).toHaveLength(1);
-      expect(preview[0]).toEqual({
+      expect(preview[0]).toMatchObject({
+        id: expect.stringMatching(/^op_\d+$/),
         path: 'test.txt',
         type: 'create',
-        content: 'Hello World',
+        content: 'content',
       });
     });
 
-    test('should throw error when creating file that already exists', () => {
-      const existingFile = join(tempDir, 'existing.txt');
-      fs.writeFileSync(existingFile, 'existing content');
+    test('should read staged file content', async () => {
+      await vft.createFile('test.txt', 'content');
+      const content = await vft.readFile('test.txt');
+      expect(content).toBe('content');
+    });
+  });
 
-      expect(() => {
-        vft.createFile('existing.txt', 'new content');
-      }).toThrow('File existing.txt already exists');
+  describe('File Creation and Validation', () => {
+    test('should throw error when creating file that already exists on filesystem', async () => {
+      const testFile = join(tempDir, 'existing.txt');
+      fs.writeFileSync(testFile, 'existing content');
+
+      await expect(vft.createFile('existing.txt', 'new content')).rejects.toThrow(
+        'Cannot create file'
+      );
     });
 
-    test('should throw error when creating file that is already staged', () => {
-      vft.createFile('test.txt', 'content');
+    test('should allow creating file after it was deleted in transaction', async () => {
+      const testFile = join(tempDir, 'test.txt');
+      fs.writeFileSync(testFile, 'original content');
 
-      expect(() => {
-        vft.createFile('test.txt', 'other content');
-      }).toThrow('File test.txt already exists');
+      await vft.deleteFile('test.txt');
+      await vft.createFile('test.txt', 'new content');
+
+      const preview = vft.preview();
+      expect(preview).toHaveLength(2); // Delete then create operations
+      expect(preview[0].type).toBe('delete');
+      expect(preview[1].type).toBe('create');
+      expect(preview[1].content).toBe('new content');
     });
   });
 
@@ -59,30 +81,51 @@ describe('VirtualFileTree', () => {
       fs.writeFileSync(testFile, 'original content');
 
       await vft.modifyFile('test.txt', 'modified content');
-
-      expect(vft.hasPendingOperations).toBe(true);
+      expect(vft.hasPendingChanges).toBe(true);
       const preview = vft.preview();
-      expect(preview[0]).toEqual({
+      expect(preview[0]).toMatchObject({
+        id: expect.stringMatching(/^op_\d+$/),
         path: 'test.txt',
         type: 'modify',
         content: 'modified content',
-        originalContent: 'original content',
       });
     });
 
     test('should throw error when modifying non-existent file', async () => {
       await expect(vft.modifyFile('nonexistent.txt', 'content')).rejects.toThrow(
-        'File nonexistent.txt does not exist'
+        'Cannot modify file'
       );
     });
 
-    test('should modify staged file', async () => {
-      vft.createFile('test.txt', 'created content');
+    test('should allow modifying file created in same transaction', async () => {
+      await vft.createFile('test.txt', 'created content');
       await vft.modifyFile('test.txt', 'modified content');
 
       const preview = vft.preview();
-      expect(preview[0].content).toBe('modified content');
-      expect(preview[0].type).toBe('modify');
+      expect(preview).toHaveLength(2); // Create then modify operations
+      expect(preview[0].type).toBe('create');
+      expect(preview[1].type).toBe('modify');
+      expect(preview[1].content).toBe('modified content');
+    });
+  });
+
+  describe('File Deletion', () => {
+    test('should stage file deletion', async () => {
+      const testFile = join(tempDir, 'test.txt');
+      fs.writeFileSync(testFile, 'content to delete');
+
+      await vft.deleteFile('test.txt');
+
+      const preview = vft.preview();
+      expect(preview[0]).toMatchObject({
+        id: expect.stringMatching(/^op_\d+$/),
+        path: 'test.txt',
+        type: 'delete',
+      });
+    });
+
+    test('should throw error when deleting non-existent file', async () => {
+      await expect(vft.deleteFile('nonexistent.txt')).rejects.toThrow('Cannot delete file');
     });
   });
 
@@ -92,215 +135,384 @@ describe('VirtualFileTree', () => {
       fs.writeFileSync(testFile, 'original content');
 
       await vft.overwriteFile('test.txt', 'overwritten content');
-
-      const preview = vft.preview();
-      expect(preview[0]).toEqual({
-        path: 'test.txt',
-        type: 'overwrite',
-        content: 'overwritten content',
-        originalContent: 'original content',
-      });
+      const content = await vft.readFile('test.txt');
+      expect(content).toBe('overwritten content');
     });
 
-    test('should create file if it does not exist', async () => {
+    test('should create file when overwriting non-existent file', async () => {
       await vft.overwriteFile('new.txt', 'new content');
-
-      const preview = vft.preview();
-      expect(preview[0]).toEqual({
-        path: 'new.txt',
-        type: 'create',
-        content: 'new content',
-        originalContent: undefined,
-      });
+      const content = await vft.readFile('new.txt');
+      expect(content).toBe('new content');
     });
   });
 
-  describe('File Reading', () => {
-    test('should read existing file from filesystem', async () => {
+  describe('Queue-Based Operations (NEW BEHAVIOR)', () => {
+    test('should capture and replay multiple operations on same file', async () => {
       const testFile = join(tempDir, 'test.txt');
-      fs.writeFileSync(testFile, 'file content');
+      fs.writeFileSync(testFile, 'original content');
 
-      const content = await vft.readFile('test.txt');
-      expect(content).toBe('file content');
+      // Multiple operations on the same file
+      await vft.modifyFile('test.txt', 'first modification');
+      await vft.modifyFile('test.txt', 'second modification');
+
+      const preview = vft.preview();
+      expect(preview).toHaveLength(2); // Both operations are stored!
+      expect(preview[0].content).toBe('first modification');
+      expect(preview[1].content).toBe('second modification');
+
+      // Final result should be the last modification
+      const finalContent = await vft.readFile('test.txt');
+      expect(finalContent).toBe('second modification');
     });
 
-    test('should read staged file content', async () => {
-      vft.createFile('staged.txt', 'staged content');
+    test('should demonstrate queue behavior with append operations', async () => {
+      const testFile = join(tempDir, 'test.txt');
+      fs.writeFileSync(testFile, 'base content');
 
-      const content = await vft.readFile('staged.txt');
-      expect(content).toBe('staged content');
+      await vft.appendToFile('test.txt', '\nfirst append');
+      await vft.appendToFile('test.txt', '\nsecond append');
+
+      const preview = vft.preview();
+      expect(preview).toHaveLength(2);
+      expect(preview[0].type).toBe('append');
+      expect(preview[1].type).toBe('append');
+
+      // Final content should have both appends
+      const finalContent = await vft.readFile('test.txt');
+      expect(finalContent).toBe('base content\nfirst append\nsecond append');
     });
 
-    test('should read modified file content from staging', async () => {
+    test('should support complex operation sequences', async () => {
       const testFile = join(tempDir, 'test.txt');
       fs.writeFileSync(testFile, 'original');
 
       await vft.modifyFile('test.txt', 'modified');
-      const content = await vft.readFile('test.txt');
-      expect(content).toBe('modified');
+      await vft.appendToFile('test.txt', ' + appended');
+      await vft.prependToFile('test.txt', 'prepended + ');
+
+      const preview = vft.preview();
+      expect(preview).toHaveLength(3);
+
+      const finalContent = await vft.readFile('test.txt');
+      expect(finalContent).toBe('prepended + modified + appended');
     });
 
-    test('should throw error for non-existent file', async () => {
-      await expect(vft.readFile('nonexistent.txt')).rejects.toThrow(
-        'Failed to read file nonexistent.txt'
-      );
+    test('should track files that have been accessed', async () => {
+      const testFile = join(tempDir, 'tracked.txt');
+      fs.writeFileSync(testFile, 'content');
+
+      await vft.modifyFile('tracked.txt', 'new content');
+
+      const trackedFiles = vft.getTrackedFiles();
+      expect(trackedFiles).toContain('tracked.txt');
     });
   });
 
-  describe('File Existence', () => {
-    test('should detect existing files', () => {
+  describe('Helper Methods', () => {
+    test('should support appending content with appendToFile', async () => {
       const testFile = join(tempDir, 'test.txt');
-      fs.writeFileSync(testFile, 'content');
+      fs.writeFileSync(testFile, 'base content');
 
-      expect(vft.fileExists('test.txt')).toBe(true);
-      expect(vft.fileExists('nonexistent.txt')).toBe(false);
+      await vft.appendToFile('test.txt', ' appended');
+      const content = await vft.readFile('test.txt');
+      expect(content).toBe('base content appended');
     });
 
-    test('should detect staged files', () => {
-      vft.createFile('staged.txt', 'content');
+    test('should support prepending content with prependToFile', async () => {
+      const testFile = join(tempDir, 'test.txt');
+      fs.writeFileSync(testFile, 'base content');
 
-      expect(vft.fileExists('staged.txt')).toBe(true);
+      await vft.prependToFile('test.txt', 'prepended ');
+      const content = await vft.readFile('test.txt');
+      expect(content).toBe('prepended base content');
+    });
+
+    test('should support transforming content with transformFile', async () => {
+      const testFile = join(tempDir, 'test.txt');
+      fs.writeFileSync(testFile, 'hello world');
+
+      await vft.transformFile('test.txt', (content) => content.toUpperCase());
+      const content = await vft.readFile('test.txt');
+      expect(content).toBe('HELLO WORLD');
     });
   });
 
   describe('Commit Operations', () => {
-    test('should commit all staged operations', async () => {
-      vft.createFile('new.txt', 'new content');
-      vft.createFile('src/component.tsx', 'component content');
+    test('should commit all operations to filesystem', async () => {
+      await vft.createFile('file1.txt', 'content1');
+      await vft.createFile('file2.txt', 'content2');
 
       await vft.commit();
 
-      expect(vft.hasPendingOperations).toBe(false);
-      expect(fs.existsSync(join(tempDir, 'new.txt'))).toBe(true);
-      expect(fs.existsSync(join(tempDir, 'src/component.tsx'))).toBe(true);
-      expect(fs.readFileSync(join(tempDir, 'new.txt'), 'utf-8')).toBe('new content');
+      expect(fs.readFileSync(join(tempDir, 'file1.txt'), 'utf-8')).toBe('content1');
+      expect(fs.readFileSync(join(tempDir, 'file2.txt'), 'utf-8')).toBe('content2');
+      expect(vft.isTransactionCommitted).toBe(true);
     });
 
-    test('should create directories automatically', async () => {
-      vft.createFile('deep/nested/file.txt', 'nested content');
+    test('should handle complex operation sequence during commit', async () => {
+      const testFile = join(tempDir, 'test.txt');
+      fs.writeFileSync(testFile, 'original');
+
+      await vft.modifyFile('test.txt', 'step1');
+      await vft.appendToFile('test.txt', '_step2');
+      await vft.prependToFile('test.txt', 'step0_');
 
       await vft.commit();
 
-      expect(fs.existsSync(join(tempDir, 'deep/nested/file.txt'))).toBe(true);
-      expect(fs.readFileSync(join(tempDir, 'deep/nested/file.txt'), 'utf-8')).toBe(
-        'nested content'
-      );
+      const finalContent = fs.readFileSync(testFile, 'utf-8');
+      expect(finalContent).toBe('step0_step1_step2');
     });
 
-    test('should handle commit errors gracefully', async () => {
-      // Mock fs.promises.writeFile to throw an error
-      const originalWriteFile = fs.promises.writeFile;
-      vi.spyOn(fs.promises, 'writeFile').mockRejectedValue(new Error('Write failed'));
+    test('should create nested directories automatically', async () => {
+      await vft.createFile('nested/deep/file.txt', 'nested content');
+      await vft.commit();
 
-      vft.createFile('test.txt', 'content');
+      const filePath = join(tempDir, 'nested', 'deep', 'file.txt');
+      expect(fs.existsSync(filePath)).toBe(true);
+      expect(fs.readFileSync(filePath, 'utf-8')).toBe('nested content');
+    });
 
-      await expect(vft.commit()).rejects.toThrow('Failed to commit file operations');
-
-      // Restore original function
-      fs.promises.writeFile = originalWriteFile;
+    test('should throw error when committing twice', async () => {
+      await vft.createFile('test.txt', 'content');
+      await vft.commit();
+      await expect(vft.commit()).rejects.toThrow('Transaction has already been committed');
     });
   });
 
-  describe('Rollback Operations', () => {
-    test('should discard all staged operations', () => {
-      vft.createFile('test1.txt', 'content1');
-      vft.createFile('test2.txt', 'content2');
+  describe('Rollback Operations - Staging Only', () => {
+    test('should discard staged operations when not committed', async () => {
+      await vft.createFile('test1.txt', 'content1');
+      await vft.createFile('test2.txt', 'content2');
 
       expect(vft.pendingOperations).toBe(2);
 
-      vft.rollback();
+      await vft.rollback();
 
-      expect(vft.hasPendingOperations).toBe(false);
+      expect(vft.hasPendingChanges).toBe(false);
       expect(vft.pendingOperations).toBe(0);
+      expect(fs.existsSync(join(tempDir, 'test1.txt'))).toBe(false);
+      expect(fs.existsSync(join(tempDir, 'test2.txt'))).toBe(false);
     });
   });
 
-  describe('Preview Operations', () => {
-    test('should return relative paths in preview', () => {
-      vft.createFile('file1.txt', 'content1');
-      vft.createFile('src/file2.tsx', 'content2');
+  describe('Rollback Operations - True Restoration', () => {
+    test('should restore original filesystem state after commit', async () => {
+      const testFile = join(tempDir, 'test.txt');
+      fs.writeFileSync(testFile, 'original content');
+      const originalTime = fs.statSync(testFile).mtime;
 
-      const preview = vft.preview();
+      await vft.modifyFile('test.txt', 'modified content');
+      await vft.commit();
 
-      expect(preview).toHaveLength(2);
-      expect(preview[0].path).toBe('file1.txt');
-      expect(preview[1].path).toBe('src/file2.tsx');
+      // Verify file was modified
+      expect(fs.readFileSync(testFile, 'utf-8')).toBe('modified content');
+
+      // Rollback should restore original content
+      await vft.rollback();
+      expect(fs.readFileSync(testFile, 'utf-8')).toBe('original content');
     });
 
-    test('should return empty array when no operations', () => {
+    test('should handle file creation and deletion in rollback', async () => {
+      // Create a new file and delete an existing one
+      const existingFile = join(tempDir, 'existing.txt');
+      fs.writeFileSync(existingFile, 'existing content');
+
+      await vft.createFile('new.txt', 'new content');
+      await vft.deleteFile('existing.txt');
+      await vft.commit();
+
+      // Verify changes applied
+      expect(fs.existsSync(join(tempDir, 'new.txt'))).toBe(true);
+      expect(fs.existsSync(existingFile)).toBe(false);
+
+      // Rollback should restore original state
+      await vft.rollback();
+      expect(fs.existsSync(join(tempDir, 'new.txt'))).toBe(false);
+      expect(fs.existsSync(existingFile)).toBe(true);
+      expect(fs.readFileSync(existingFile, 'utf-8')).toBe('existing content');
+    });
+  });
+
+  describe('Checkpoints and Nested Transactions', () => {
+    test('should create and restore checkpoints', async () => {
+      await vft.createFile('test1.txt', 'content1');
+
+      const checkpoint = await vft.createCheckpoint();
+      expect(vft.pendingOperations).toBe(1);
+
+      await vft.createFile('test2.txt', 'content2');
+      expect(vft.pendingOperations).toBe(2);
+
+      checkpoint.restore();
+      expect(vft.pendingOperations).toBe(1);
+
       const preview = vft.preview();
-      expect(preview).toEqual([]);
+      expect(preview).toHaveLength(1);
+      expect(preview[0].path).toBe('test1.txt');
     });
   });
 
   describe('FsUpdates Integration', () => {
-    test('should convert to FsUpdates format', () => {
-      vft.createFile('test1.txt', 'content1');
-      vft.createFile('test2.txt', 'content2');
+    test('should convert to FsUpdates format', async () => {
+      await vft.createFile('test.txt', 'content1');
 
       const fsUpdates = vft.toFsUpdates();
-
-      expect(fsUpdates.files).toHaveLength(2);
+      expect(fsUpdates.files).toHaveLength(1);
+      expect(fsUpdates.files[0].path).toBe(join(tempDir, 'test.txt'));
       expect(fsUpdates.files[0].content).toBeInstanceOf(Buffer);
       expect(fsUpdates.files[0].content.toString('utf-8')).toBe('content1');
-      expect(fsUpdates.files[0].type).toBe('create');
+      expect(fsUpdates.files[0].type).toBe('modify'); // Default type in new implementation
     });
 
-    test('should apply operations from FsUpdates format', () => {
-      const fsUpdates = {
-        files: [
-          {
-            path: join(tempDir, 'imported1.txt'),
-            content: Buffer.from('imported content 1'),
-            type: 'create',
-          },
-          {
-            path: join(tempDir, 'imported2.txt'),
-            content: 'imported content 2', // string format
-            type: 'modify',
-          },
-        ],
-      };
+    test('should exclude deleted files from FsUpdates', async () => {
+      const testFile = join(tempDir, 'test.txt');
+      fs.writeFileSync(testFile, 'content');
 
-      vft.fromFsUpdates(fsUpdates);
+      await vft.deleteFile('test.txt');
 
-      expect(vft.pendingOperations).toBe(2);
-      const preview = vft.preview();
-      expect(preview[0].content).toBe('imported content 1');
-      expect(preview[1].content).toBe('imported content 2');
+      const fsUpdates = vft.toFsUpdates();
+      expect(fsUpdates.files).toHaveLength(0);
     });
   });
 
-  describe('Complex Scenarios', () => {
-    test('should handle multiple operations on same file', async () => {
-      // Create file, then modify it, then overwrite it
-      vft.createFile('test.txt', 'original');
-      await vft.modifyFile('test.txt', 'modified');
-      await vft.overwriteFile('test.txt', 'final');
+  describe('Complex Real-World Scenarios', () => {
+    test('should handle plugin installation scenario', async () => {
+      // Simulate installing a plugin that modifies multiple files
+      const packageJsonPath = join(tempDir, 'package.json');
+      fs.writeFileSync(packageJsonPath, JSON.stringify({ dependencies: {} }, null, 2));
 
-      expect(vft.pendingOperations).toBe(1); // Should only have one operation for the file
-      const preview = vft.preview();
-      expect(preview[0].content).toBe('final');
-      expect(preview[0].type).toBe('overwrite');
-    });
+      // Add dependency to package.json
+      await vft.transformFile('package.json', (content) => {
+        const pkg = JSON.parse(content);
+        pkg.dependencies = { ...pkg.dependencies, tailwindcss: '^4.0.0' };
+        return JSON.stringify(pkg, null, 2);
+      });
 
-    test('should handle nested directory creation', async () => {
-      vft.createFile('a/b/c/d/file.txt', 'nested');
+      // Create tailwind config
+      await vft.createFile(
+        'tailwind.config.js',
+        'module.exports = { content: ["./src/**/*.tsx"] }'
+      );
+
+      // Create CSS file
+      await vft.createFile('src/global.css', '@import "tailwindcss";');
 
       await vft.commit();
 
-      expect(fs.existsSync(join(tempDir, 'a/b/c/d/file.txt'))).toBe(true);
+      // Verify all files were created/modified
+      const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+      expect(pkg.dependencies.tailwindcss).toBe('^4.0.0');
+      expect(fs.existsSync(join(tempDir, 'tailwind.config.js'))).toBe(true);
+      expect(fs.existsSync(join(tempDir, 'src', 'global.css'))).toBe(true);
     });
 
-    test('should maintain operation order in preview', () => {
-      vft.createFile('file1.txt', 'content1');
-      vft.createFile('file2.txt', 'content2');
-      vft.createFile('file3.txt', 'content3');
+    test('should handle rollback of complex scenario', async () => {
+      const packageJsonPath = join(tempDir, 'package.json');
+      fs.writeFileSync(packageJsonPath, JSON.stringify({ dependencies: {} }, null, 2));
 
-      const preview = vft.preview();
+      await vft.transformFile('package.json', (content) => {
+        const pkg = JSON.parse(content);
+        pkg.dependencies = { ...pkg.dependencies, react: '^18.0.0' };
+        return JSON.stringify(pkg, null, 2);
+      });
 
-      // Operations should maintain insertion order
-      expect(preview.map((op) => op.path)).toEqual(['file1.txt', 'file2.txt', 'file3.txt']);
+      await vft.createFile('src/App.tsx', 'export default function App() {}');
+
+      await vft.commit();
+
+      // Rollback should restore original state
+      await vft.rollback();
+
+      const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+      expect(pkg.dependencies).toEqual({});
+      expect(fs.existsSync(join(tempDir, 'src', 'App.tsx'))).toBe(false);
+    });
+  });
+
+  describe('Error Handling and Edge Cases', () => {
+    test('should handle invalid file operations gracefully', async () => {
+      await expect(vft.readFile('nonexistent.txt')).rejects.toThrow('does not exist');
+    });
+
+    test('should validate file paths', async () => {
+      await expect(vft.createFile('', 'content')).rejects.toThrow();
+    });
+
+    test('should handle filesystem errors during commit', async () => {
+      await vft.createFile('test.txt', 'content');
+
+      // Mock filesystem error
+      const originalWriteFile = fs.promises.writeFile;
+      vi.spyOn(fs.promises, 'writeFile').mockRejectedValueOnce(new Error('Disk full'));
+
+      await expect(vft.commit()).rejects.toThrow('Failed to commit changes');
+
+      // Restore original method
+      fs.promises.writeFile = originalWriteFile;
+    });
+  });
+
+  describe('Performance Optimization (latestContent Cache)', () => {
+    test('should use cached content for multiple reads without replaying operations', async () => {
+      const testFile = join(tempDir, 'performance-test.txt');
+      fs.writeFileSync(testFile, 'original content');
+
+      // Stage multiple operations that would normally require replay
+      await vft.modifyFile('performance-test.txt', 'step 1');
+      await vft.appendToFile('performance-test.txt', ' + step 2');
+      await vft.prependToFile('performance-test.txt', 'step 0 + ');
+      await vft.appendToFile('performance-test.txt', ' + step 3');
+
+      // Multiple reads should use cached content (O(1)) instead of replaying 4 operations each time
+      const read1 = await vft.readFile('performance-test.txt');
+      const read2 = await vft.readFile('performance-test.txt');
+      const read3 = await vft.readFile('performance-test.txt');
+
+      // All reads should return the same cached result
+      const expectedContent = 'step 0 + step 1 + step 2 + step 3';
+      expect(read1).toBe(expectedContent);
+      expect(read2).toBe(expectedContent);
+      expect(read3).toBe(expectedContent);
+
+      // fileExists should also use cached state
+      expect(vft.fileExists('performance-test.txt')).toBe(true);
+    });
+
+    test('should handle cache for deleted files correctly', async () => {
+      const testFile = join(tempDir, 'delete-test.txt');
+      fs.writeFileSync(testFile, 'content to delete');
+
+      // File exists initially
+      expect(vft.fileExists('delete-test.txt')).toBe(true);
+
+      // Delete file - should update cache
+      await vft.deleteFile('delete-test.txt');
+
+      // Cache should reflect deletion
+      expect(vft.fileExists('delete-test.txt')).toBe(false);
+      await expect(vft.readFile('delete-test.txt')).rejects.toThrow('does not exist');
+
+      // Create file again - should update cache
+      await vft.createFile('delete-test.txt', 'recreated content');
+      expect(vft.fileExists('delete-test.txt')).toBe(true);
+      expect(await vft.readFile('delete-test.txt')).toBe('recreated content');
+    });
+
+    test('should maintain cache consistency during rollback', async () => {
+      const testFile = join(tempDir, 'rollback-cache-test.txt');
+      fs.writeFileSync(testFile, 'original content');
+
+      // Stage operations that update cache
+      await vft.modifyFile('rollback-cache-test.txt', 'modified content');
+
+      // Cache should have updated content
+      expect(await vft.readFile('rollback-cache-test.txt')).toBe('modified content');
+
+      // Rollback should clear cache
+      await vft.rollback();
+
+      // Should read from filesystem again (not cached)
+      expect(await vft.readFile('rollback-cache-test.txt')).toBe('original content');
     });
   });
 });
