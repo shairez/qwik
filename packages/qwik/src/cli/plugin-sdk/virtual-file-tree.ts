@@ -379,6 +379,18 @@ export class VirtualFileTree {
     return Array.from(this.originalStates.keys());
   }
 
+  /** Get list of files that will be changed (for preview purposes) */
+  getChangedFiles(): string[] {
+    const changedFiles = new Set<string>();
+
+    // Add all files from operations queue
+    for (const operation of this.operationQueue) {
+      changedFiles.add(operation.path);
+    }
+
+    return Array.from(changedFiles).sort();
+  }
+
   /** Create a new transaction (preserves current state as baseline) */
   async createCheckpoint(): Promise<VirtualFileTreeCheckpoint> {
     return new VirtualFileTreeCheckpoint(this);

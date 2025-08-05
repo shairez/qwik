@@ -1,13 +1,14 @@
 /* eslint-disable no-console */
-import { red, dim, cyan, bgMagenta } from 'kleur/colors';
-import { AppCommand } from './utils/app-command';
+import { confirm, intro, isCancel, select } from '@clack/prompts';
+import { bgMagenta, cyan, dim, red } from 'kleur/colors';
 import { runAddCommand } from './add/run-add-command';
-import { runNewCommand } from './new/run-new-command';
+import { runInstallCommand } from './install/run-install-command';
 import { runJokeCommand } from './joke/run-joke-command';
-import { note, panic, pmRunCmd, printHeader, bye } from './utils/utils';
-import { runBuildCommand } from './utils/run-build-command';
-import { intro, isCancel, select, confirm } from '@clack/prompts';
 import { runV2Migration } from './migrate-v2/run-migration';
+import { runNewCommand } from './new/run-new-command';
+import { AppCommand } from './utils/app-command';
+import { runBuildCommand } from './utils/run-build-command';
+import { bye, note, panic, pmRunCmd, printHeader } from './utils/utils';
 
 const SPACE_TO_HINT = 18;
 const COMMANDS = [
@@ -16,6 +17,13 @@ const COMMANDS = [
     label: 'add',
     hint: 'Add an integration to this app',
     run: (app: AppCommand) => runAddCommand(app),
+    showInHelp: true,
+  },
+  {
+    value: 'install',
+    label: 'install',
+    hint: 'Install a community plugin',
+    run: (app: AppCommand) => runInstallCommand(app),
     showInHelp: true,
   },
   {
@@ -88,6 +96,10 @@ async function runCommand(app: AppCommand) {
   switch (app.task) {
     case 'add': {
       await runAddCommand(app);
+      return;
+    }
+    case 'install': {
+      await runInstallCommand(app);
       return;
     }
     case 'build': {

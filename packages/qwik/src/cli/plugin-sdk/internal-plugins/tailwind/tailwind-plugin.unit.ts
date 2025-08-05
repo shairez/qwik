@@ -2,7 +2,7 @@ import fs, { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import { runPlugin } from './plugin-context';
+import { runPlugin } from '../../plugin-context';
 import { tailwindPlugin } from './tailwind-plugin';
 
 describe('Tailwind Plugin - Minimal API Test', () => {
@@ -46,8 +46,8 @@ export default defineConfig({
   });
 
   test('should install tailwind plugin correctly using minimal API', async () => {
-    // Run our tailwind plugin
-    await runPlugin(tailwindPlugin, tempDir);
+    // Run our tailwind plugin with plugin name for template resolution
+    await runPlugin(tailwindPlugin, tempDir, 'tailwind');
 
     // Verify package.json was updated correctly
     const packageJson = JSON.parse(fs.readFileSync(join(tempDir, 'package.json'), 'utf-8'));
@@ -60,7 +60,7 @@ export default defineConfig({
     // Verify vite.config.ts was updated
     const viteConfig = fs.readFileSync(join(tempDir, 'vite.config.ts'), 'utf-8');
     expect(viteConfig).toContain("import tailwindcss from '@tailwindcss/vite';");
-    expect(viteConfig).toContain('tailwindcss(),');
+    expect(viteConfig).toContain('tailwindcss()');
 
     // Verify CSS file was created
     const cssContent = fs.readFileSync(join(tempDir, 'src/global.css'), 'utf-8');
@@ -86,22 +86,16 @@ export default defineConfig({
   });
 
   test('should work with different vite config file extensions', async () => {
-    // Test with .js extension
-    fs.unlinkSync(join(tempDir, 'vite.config.ts'));
-    fs.writeFileSync(
-      join(tempDir, 'vite.config.js'),
-      `import { defineConfig } from 'vite';
+    // Create vite.config.mts instead of .ts
+    const viteConfigMts = `import { defineConfig } from 'vite';\nimport { qwikVite } from '@builder.io/qwik/optimizer';\n\nexport default defineConfig({\n  plugins: [qwikVite()]\n});`;
+    fs.writeFileSync(join(tempDir, 'vite.config.mts'), viteConfigMts);
+    fs.unlinkSync(join(tempDir, 'vite.config.ts')); // Remove the .ts version
 
-export default defineConfig({
-  plugins: []
-});
-`
-    );
+    // Run our tailwind plugin with plugin name for template resolution
+    await runPlugin(tailwindPlugin, tempDir, 'tailwind');
 
-    await runPlugin(tailwindPlugin, tempDir);
-
-    const viteConfig = fs.readFileSync(join(tempDir, 'vite.config.js'), 'utf-8');
+    const viteConfig = fs.readFileSync(join(tempDir, 'vite.config.mts'), 'utf-8');
     expect(viteConfig).toContain("import tailwindcss from '@tailwindcss/vite';");
-    expect(viteConfig).toContain('tailwindcss(),');
+    expect(viteConfig).toContain('tailwindcss()');
   });
 });
